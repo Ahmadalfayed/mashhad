@@ -49,6 +49,77 @@ const canvas = $('#preview');
 const ctx = canvas.getContext('2d');
 const wrap = $('.preview-wrap');
 let raf = 0, lastTs = 0;
+const DRIFT_SEC = 0.25;
+
+/* Single shared Web Audio graph — one source node per media element, forever */
+const AudioGraph = {
+  ctx: null, master: null, compressor: null, streamDest: null,
+  nodes: new Map(), // mediaId -> {source, gain}
+  ensure() {
+    if (this.ctx) return this.ctx;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    this.ctx = new AC({ latencyHint: 'interactive' });
+    this.master = this.ctx.createGain();
+    this.master.gain.value = 0.8; // headroom before limiter
+    this.compressor = this.ctx.createDynamicsCompressor();
+    this.compressor.threshold.value = -18;
+    this.compressor.knee.value = 12;
+    this.compressor.ratio.value = 8;
+    this.compressor.attack.value = 0.003;
+    this.compressor.release.value = 0.2;
+    this.streamDest = this.ctx.createMediaStreamDestination();
+    this.master.connect(this.compressor);
+    this.compressor.connect(this.ctx.destination);
+    this.compressor.connect(this.streamDest);
+    return this.ctx;
+  },
+  async resume() {
+    this.ensure();
+    if (this.ctx.state === 'suspended') {
+      try { await this.ctx.resume(); } catch (e) {}
+    }
+  },
+  attach(item) {
+    if (!item || !item.el || item.type === 'image') return null;
+    if (this.nodes.has(item.id)) return this.nodes.get(item.id);
+    this.ensure();
+    try {
+      const source = this.ctx.createMediaElementSource(item.el);
+      const gain = this.ctx.createGain();
+      gain.gain.value = 0;
+      source.connect(gain);
+      gain.connect(this.master);
+      // Element output is rerouted through the graph; keep element gain flat
+      item.el.muted = false;
+      item.el.volume = 1;
+      if ('preservesPitch' in item.el) item.el.preservesPitch = true;
+      if ('mozPreservesPitch' in item.el) item.el.mozPreservesPitch = true;
+      if ('webkitPreservesPitch' in item.el) item.el.webkitPreservesPitch = true;
+      const node = { source, gain };
+      this.nodes.set(item.id, node);
+      return node;
+    } catch (e) {
+      console.warn('AudioGraph.attach', e);
+      return null;
+    }
+  },
+  setGain(mediaId, v) {
+    const n = this.nodes.get(mediaId);
+    if (!n) return;
+    const g = clamp(v, 0, 1);
+    if (n._lastGain != null && Math.abs(n._lastGain - g) < 0.01) return;
+    n._lastGain = g;
+    const param = n.gain.gain;
+    const now = this.ctx.currentTime;
+    try {
+      param.cancelScheduledValues(now);
+      param.setTargetAtTime(g, now, 0.02); // short ramp avoids clicks
+    } catch (e) {
+      param.value = g;
+    }
+  }
+};
+
 
 function totalDur() {
   let d = 0;
@@ -102,7 +173,9 @@ async function importFiles(files) {
     let duration = 3, el = null;
     if (type === 'video' || type === 'audio') {
       el = document.createElement(type === 'video' ? 'video' : 'audio');
-      el.preload = 'auto'; el.src = url; el.muted = type==='video';
+      el.preload = 'auto'; el.src = url; el.muted = false; el.volume = 1;
+      if ('preservesPitch' in el) el.preservesPitch = true;
+      if ('mozPreservesPitch' in el) el.mozPreservesPitch = true;
       await new Promise(r => { el.onloadedmetadata = r; el.onerror = r; setTimeout(r, 4000); });
       duration = isFinite(el.duration) ? el.duration : 3;
       if (type === 'video') { try { el.currentTime = Math.min(0.15, duration/4); } catch(e){} }
@@ -113,6 +186,7 @@ async function importFiles(files) {
     }
     const item = {id, type, name: f.name, url, blob: f, duration, el};
     state.media.push(item);
+    AudioGraph.attach(item);
     try { await DB.put('media', id, f); } catch(e){}
     // auto add to timeline
     if (type === 'audio') addAudioClip(item);
@@ -129,7 +203,7 @@ function addAVClip(item) {
   state.clips.push({
     id: uid(), mediaId: item.id, type: item.type, name: item.name,
     start, trimStart: 0, trimEnd: item.duration,
-    speed: state.speed, transition: 'none', vol: 1
+    speed: state.speed, transition: 'none', vol: 0.85
   });
 }
 function addAudioClip(item) {
@@ -137,7 +211,7 @@ function addAudioClip(item) {
   const start = state.audios.reduce((m,c)=>Math.max(m, c.start + clipDur(c)), 0);
   state.audios.push({
     id: uid(), mediaId: item.id, type: 'audio', name: item.name,
-    start, trimStart: 0, trimEnd: item.duration, speed: 1, vol: 0.7
+    start, trimStart: 0, trimEnd: item.duration, speed: 1, vol: 0.4
   });
 }
 
@@ -266,32 +340,65 @@ function localTime(c, t) {
   return (c.trimStart || 0) + rel;
 }
 
-function syncMedia(t) {
-  // pause all
-  for (const m of state.media) {
-    if (m.el && m.el.pause) { try { m.el.pause(); } catch(e){} }
-  }
+function syncMedia(t, opts) {
+  const forceSeek = opts && opts.forceSeek;
+  AudioGraph.ensure();
+  const wanted = new Map(); // mediaId -> {lt, rate, vol}
+
   const vc = findActiveClip(state.clips, t);
-  if (vc && (vc.type === 'video')) {
+  if (vc && vc.type === 'video') {
     const m = mediaOf(vc);
     if (m && m.el) {
-      const lt = localTime(vc, t);
-      if (Math.abs((m.el.currentTime||0) - lt) > 0.12) m.el.currentTime = lt;
-      m.el.playbackRate = (vc.speed || 1) * (state.playing ? 1 : 1);
-      m.el.volume = vc.vol ?? 1;
-      if (state.playing) m.el.play().catch(()=>{});
+      AudioGraph.attach(m);
+      wanted.set(m.id, {
+        lt: localTime(vc, t),
+        rate: vc.speed || 1,
+        vol: Math.min(1, vc.vol ?? 0.85)
+      });
     }
   }
   for (const ac of state.audios) {
     if (t >= ac.start && t < ac.start + clipDur(ac)) {
       const m = mediaOf(ac);
       if (m && m.el) {
-        const lt = localTime(ac, t);
-        if (Math.abs((m.el.currentTime||0) - lt) > 0.12) m.el.currentTime = lt;
-        m.el.volume = ac.vol ?? 0.7;
-        if (state.playing) m.el.play().catch(()=>{});
+        AudioGraph.attach(m);
+        wanted.set(m.id, {
+          lt: localTime(ac, t),
+          rate: ac.speed || 1,
+          // lower default BGM to avoid clipping when mixed with clip audio
+          vol: Math.min(1, ac.vol ?? 0.4)
+        });
       }
     }
+  }
+
+  for (const m of state.media) {
+    if (!m.el || typeof m.el.pause !== 'function') continue;
+    const w = wanted.get(m.id);
+    if (!w) {
+      if (!m.el.paused) {
+        try { m.el.pause(); } catch (e) {}
+      }
+      AudioGraph.setGain(m.id, 0);
+      continue;
+    }
+    try {
+      if ('preservesPitch' in m.el) m.el.preservesPitch = true;
+      if (Math.abs((m.el.playbackRate || 1) - w.rate) > 0.001) {
+        m.el.playbackRate = w.rate;
+      }
+      const drift = Math.abs((m.el.currentTime || 0) - w.lt);
+      if (forceSeek || drift > DRIFT_SEC) {
+        try { m.el.currentTime = Math.max(0, w.lt); } catch (e) {}
+      }
+      if (state.playing) {
+        AudioGraph.setGain(m.id, w.vol);
+        if (m.el.paused) m.el.play().catch(() => {});
+      } else {
+        AudioGraph.setGain(m.id, 0);
+        if (!m.el.paused) m.el.pause();
+      }
+    } catch (e) {}
   }
 }
 
@@ -394,14 +501,19 @@ function play() {
   state.playing = true;
   $('#play').textContent = '⏸';
   lastTs = 0;
-  syncMedia(state.t);
-  raf = requestAnimationFrame(tick);
+  AudioGraph.resume().then(() => {
+    syncMedia(state.t, { forceSeek: true });
+    raf = requestAnimationFrame(tick);
+  });
 }
 function pause() {
   state.playing = false;
   $('#play').textContent = '▶';
   cancelAnimationFrame(raf);
-  for (const m of state.media) if (m.el && m.el.pause) try{m.el.pause()}catch(e){}
+  for (const m of state.media) {
+    if (m.el && m.el.pause) try { m.el.pause(); } catch (e) {}
+    AudioGraph.setGain(m.id, 0);
+  }
 }
 
 /* ---------- Selection actions ---------- */
@@ -633,7 +745,7 @@ function renderPanel() {
     p.innerHTML = `<h4>الصوت والموسيقى</h4>
       <div class="row"><button class="primary" id="addAud">＋ إضافة مقطع صوتي</button></div>
       <div class="field" style="margin-top:.5rem"><label>مستوى صوت المقطع المحدد</label>
-      <input type="range" id="vol" min="0" max="100" value="${c && c.vol!=null ? Math.round(c.vol*100) : 70}"></div>
+      <input type="range" id="vol" min="0" max="100" value="${c && c.vol!=null ? Math.round(c.vol*100) : 40}"></div>
       <p style="color:var(--mut);font-size:.78rem">يمكنك كتم صوت الفيديو بخفض مستواه إلى ٠، وإضافة موسيقى على مسار الصوت.</p>`;
     $('#addAud').onclick = () => $('#audioIn').click();
     $('#vol').oninput = e => {
@@ -687,8 +799,13 @@ async function exportVideo() {
   if (aw > ah) { W = Math.round(q * aw/ah); H = q; }
   else if (aw < ah) { W = q; H = Math.round(q * ah/aw); }
   else { W = q; H = q; }
-  // prefer mp4 if available
-  const types = ['video/webm;codecs=vp9,opus','video/webm;codecs=vp8,opus','video/webm','video/mp4'];
+  const types = [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm;codecs=vp9',
+    'video/webm',
+    'video/mp4'
+  ];
   let mime = types.find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
   $('#exFmt').textContent = `الصيغة: ${mime.includes('mp4')?'MP4':'WebM'} — ${W}×${H} — ${state.aspect}`;
   $('#exMsg').textContent = 'جاهز للتصدير';
@@ -698,114 +815,98 @@ async function exportVideo() {
     $('#exGo').disabled = true;
     $('#exMsg').textContent = 'جاري التصدير… لا تغلق الصفحة';
     pause();
+    await AudioGraph.resume();
+    for (const m of state.media) AudioGraph.attach(m);
+
     const off = document.createElement('canvas');
     off.width = W; off.height = H;
     const octx = off.getContext('2d');
     const fps = 30;
-    const stream = off.captureStream(fps);
-    // mix audio
-    const actx = new (window.AudioContext||window.webkitAudioContext)();
-    const dest = actx.createMediaStreamDestination();
-    const sources = [];
-    const addEl = (el, vol) => {
-      try {
-        const src = actx.createMediaElementSource(el);
-        const g = actx.createGain(); g.gain.value = vol;
-        src.connect(g); g.connect(dest); g.connect(actx.destination);
-        sources.push(el);
-      } catch(e) { /* already connected */ }
-    };
-    // Use WebAudio from media elements carefully — may fail if already connected.
-    // Fallback: no mixed audio track if connect fails; still export video.
-    try {
-      for (const c of state.clips) {
-        const m = mediaOf(c);
-        if (m && m.type==='video' && m.el) addEl(m.el, c.vol??1);
-      }
-      for (const c of state.audios) {
-        const m = mediaOf(c);
-        if (m && m.el) addEl(m.el, c.vol??0.7);
-      }
-      dest.stream.getAudioTracks().forEach(tr => stream.addTrack(tr));
-    } catch(e) {}
+    // Manual canvas frames when supported — avoids dropped/duped captureStream ticks
+    const canvasStream = off.captureStream(0);
+    const vTrack = canvasStream.getVideoTracks()[0];
+    const combined = new MediaStream();
+    canvasStream.getVideoTracks().forEach(tr => combined.addTrack(tr));
+    AudioGraph.streamDest.stream.getAudioTracks().forEach(tr => combined.addTrack(tr));
 
     const chunks = [];
     let rec;
+    const recOpts = { mimeType: mime, videoBitsPerSecond: 4_000_000, audioBitsPerSecond: 192_000 };
     try {
-      rec = new MediaRecorder(stream, {mimeType: mime, videoBitsPerSecond: 4_000_000});
-    } catch(e) {
-      rec = new MediaRecorder(stream);
-      mime = rec.mimeType || mime;
+      rec = new MediaRecorder(combined, recOpts);
+    } catch (e) {
+      try {
+        rec = new MediaRecorder(combined, { mimeType: mime, audioBitsPerSecond: 192_000 });
+      } catch (e2) {
+        rec = new MediaRecorder(combined);
+        mime = rec.mimeType || mime;
+      }
     }
-    rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-    const done = new Promise(r => rec.onstop = r);
-    rec.start(200);
+    rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+    const done = new Promise(r => { rec.onstop = r; });
 
     const dur = totalDur();
-    const wasPlaying = false;
-    // Manual frame stepping for reliable export
-    const step = 1/fps;
-    // Pause sync — drive currentTime ourselves
-    state.playing = false;
-    for (const m of state.media) if (m.el && m.el.pause) try{m.el.pause()}catch(e){}
-
-    for (let t = 0; t <= dur + 0.001; t += step) {
-      // seek video frames
-      for (const c of state.clips) {
-        if (t >= c.start && t < c.start + clipDur(c) && c.type==='video') {
-          const m = mediaOf(c);
-          if (m && m.el) {
-            const lt = localTime(c, t);
-            if (Math.abs(m.el.currentTime - lt) > 0.05) {
-              m.el.currentTime = lt;
-              await new Promise(r => {
-                const to = setTimeout(r, 120);
-                m.el.onseeked = () => { clearTimeout(to); r(); };
-              });
-            }
-          }
-        }
-      }
-      for (const c of state.audios) {
-        if (t >= c.start && t < c.start + clipDur(c)) {
-          const m = mediaOf(c);
-          if (m && m.el) {
-            const lt = localTime(c, t);
-            try {
-              if (Math.abs(m.el.currentTime - lt) > 0.08) m.el.currentTime = lt;
-              m.el.volume = c.vol ?? 0.7;
-              await m.el.play().catch(()=>{});
-            } catch(e){}
-          }
-        } else {
-          const m = mediaOf(c);
-          if (m && m.el) try{m.el.pause()}catch(e){}
-        }
-      }
-      drawFrameAt(t, octx, W, H);
-      // wait a frame for captureStream
-      await new Promise(r => setTimeout(r, 1000/fps * 0.85));
-      const pct = Math.min(100, Math.round((t/dur)*100));
-      $('#exBar').style.width = pct + '%';
-      $('#exMsg').textContent = `تصدير… ${pct}%`;
+    // Real-time export: let media elements play naturally (no per-frame seeking)
+    state.t = 0;
+    state.playing = true;
+    syncMedia(0, { forceSeek: true });
+    // Kick play on active elements
+    for (const m of state.media) {
+      const active = [...state.clips, ...state.audios].some(c =>
+        c.mediaId === m.id && 0 >= c.start && 0 < c.start + clipDur(c)
+      );
+      if (active && m.el && m.el.play) m.el.play().catch(() => {});
     }
-    for (const m of state.media) if (m.el && m.el.pause) try{m.el.pause()}catch(e){}
-    rec.stop();
+
+    rec.start(100);
+    const wall0 = performance.now();
+    await new Promise(resolve => {
+      const tickExport = () => {
+        const elapsed = (performance.now() - wall0) / 1000;
+        state.t = Math.min(elapsed, dur);
+        // Natural playback — only correct large drift
+        syncMedia(state.t);
+        drawFrameAt(state.t, octx, W, H);
+        try {
+          if (vTrack && typeof vTrack.requestFrame === 'function') vTrack.requestFrame();
+        } catch (e) {}
+        const pct = Math.min(100, Math.round((state.t / dur) * 100));
+        $('#exBar').style.width = pct + '%';
+        $('#exMsg').textContent = `تصدير… ${pct}%`;
+        if (elapsed < dur) {
+          requestAnimationFrame(tickExport);
+        } else {
+          resolve();
+        }
+      };
+      requestAnimationFrame(tickExport);
+    });
+
+    // Brief tail so encoder flushes audio
+    await new Promise(r => setTimeout(r, 200));
+    state.playing = false;
+    for (const m of state.media) {
+      if (m.el && m.el.pause) try { m.el.pause(); } catch (e) {}
+      AudioGraph.setGain(m.id, 0);
+    }
+    try { rec.stop(); } catch (e) {}
     await done;
-    try { actx.close(); } catch(e){}
-    const blob = new Blob(chunks, {type: mime});
+
+    const blob = new Blob(chunks, { type: mime });
     const url = URL.createObjectURL(blob);
     const a = $('#exLink');
     a.href = url;
-    a.download = `mashhad-${Date.now()}.${mime.includes('mp4')?'mp4':'webm'}`;
+    a.download = `mashhad-${Date.now()}.${mime.includes('mp4') ? 'mp4' : 'webm'}`;
     a.hidden = false;
-    a.textContent = `⬇ تنزيل (${(blob.size/1024/1024).toFixed(1)} MB)`;
+    a.textContent = `⬇ تنزيل (${(blob.size / 1024 / 1024).toFixed(1)} MB)`;
     $('#exMsg').textContent = 'اكتمل التصدير ✓';
     $('#exBar').style.width = '100%';
     $('#exGo').disabled = false;
+    $('#play').textContent = '▶';
     toast('الفيديو جاهز للتنزيل');
   };
 }
+
 $('#exClose').onclick = () => { $('#exportDlg').hidden = true; };
 
 /* ---------- Persist ---------- */
@@ -838,6 +939,7 @@ async function loadProject() {
         await new Promise(r=>{el.onload=r; el.onerror=r});
       }
       state.media.push({...meta, url, blob, el});
+      AudioGraph.attach(state.media[state.media.length-1]);
     }
     $('#empty').classList.toggle('hidden', state.clips.length>0);
   } catch(e){ console.warn(e); }
